@@ -1273,9 +1273,13 @@ class ObjectMultiplexed(ObjectPixelated):
 
     @property
     def obj(self):
-        # Apply hard constraints to all channels in one vectorized call
-        # This avoids the loop overhead and tensor allocation per channel
-        return self.apply_hard_constraints(self._obj, mask=self.mask)
+        # applying the hard containts to each channel separately
+        post_constraint_obj = torch.zeros_like(self._obj)
+        for ch in range(self._obj.shape[0]):
+            post_constraint_obj[ch] = self.apply_hard_constraints(
+                self._obj[ch], mask=self.mask
+            )
+        return post_constraint_obj
 
     def _initialize_obj(
         self,
