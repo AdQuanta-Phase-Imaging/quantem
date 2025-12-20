@@ -1378,16 +1378,47 @@ class ObjectMultiplexed(ObjectPixelated):
         return loss
 
     def forward(self, patch_indices: torch.Tensor, batch_indices: torch.Tensor):
-        """Get patch indices of the object"""
-        # using the batch indicies to select which channel to use for each patch
-        patches = []
-        # return self._get_obj_patches(self.obj[0,...], patch_indices)
-        for i, batch_id in enumerate(batch_indices):
-            # find the correct object channel
-            ch = int(self.patches_mask[batch_id])
-            patch = self._get_obj_patches(self.obj[ch,...], patch_indices[i])
-            patches.append(patch)
-        return torch.stack(patches, dim=0).transpose(0,1)
+        """Extract object patches for each batch item from its assigned channel.
+        
+        Uses vectorized gather to avoid GPU→CPU sync from int() calls in a loop.
+        
+        Args:
+            patch_indices: (batch_size, patch_h, patch_w) flat indices into object spatial dims
+            batch_indices: (batch_size,) which scan positions in this batch
+            
+        Returns:
+            (num_slices, batch_size, patch_h, patch_w) complex patches
+            
+        Shape abbreviations in comments:
+            B = batch_size, C = num_channels, S = num_slices
+            oH, oW = obj_h, obj_w
+            pH, pW = patch_h, patch_w
+            P = pH * pW (flattened patch pixels)
+            O = oH * oW (flattened object pixels)
+        """
+        # Get channel assignment for each batch item
+        channels = self.patches_mask[batch_indices].long()
+        
+        # Select the correct channel for each batch item
+        obj = self.obj  # (C, S, oH, oW)
+        obj_per_batch = obj[channels]  # (B, S, oH, oW)
+        
+        # Flatten spatial dims for gather
+        batch_size, num_slices = obj_per_batch.shape[:2]
+        patch_shape = patch_indices.shape[1:]  # (pH, pW)
+        obj_flat = obj_per_batch.reshape(batch_size, num_slices, -1)  # (B, S, O)
+        idx_flat = patch_indices.reshape(batch_size, -1)  # (B, P)
+        
+        # Gather patches - use real view for MPS compatibility
+        idx = idx_flat[:, None, :].expand(-1, num_slices, -1)  # (B, S, P)
+        obj_real = torch.view_as_real(obj_flat)  # (B, S, O, 2)
+        idx_real = idx[:, :, :, None].expand(-1, -1, -1, 2)  # (B, S, P, 2)
+        patches_real = torch.gather(obj_real, dim=2, index=idx_real)  # (B, S, P, 2)
+        patches_flat = torch.view_as_complex(patches_real.contiguous())  # (B, S, P)
+        
+        # Reshape to output: (S, B, pH, pW)
+        patches = patches_flat.reshape(batch_size, num_slices, *patch_shape)  # (B, S, pH, pW)
+        return patches.transpose(0, 1)  # (S, B, pH, pW)
 
 # class ObjectImplicit(ObjectBase):
 #     """
