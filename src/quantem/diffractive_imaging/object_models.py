@@ -1344,8 +1344,12 @@ class ObjectMultiplexed(ObjectPixelated):
     def get_multi_channel_tv_loss(self, obj, weight, channels=(1,0)):
         loss = self._get_zero_loss_tensor()
         diff_phase = obj[channels[0],...].angle() - obj[channels[1],...].angle()        
-        loss = loss + weight * torch.mean(torch.abs(diff_phase.diff(dim=-1)))
-        loss = loss + weight * torch.mean(torch.abs(diff_phase.diff(dim=-2)))
+        col_grad = diff_phase.diff(dim=-1)
+        row_grad = diff_phase.diff(dim=-2)
+        grad_size = torch.sqrt(row_grad[:,:,:-1]**2 + col_grad[:,:-1,:]**2 + 1e-6)
+        loss = loss + weight * torch.mean(grad_size)
+        # loss = loss + weight * torch.mean(torch.abs(diff_phase.diff(dim=-1)))
+        # loss = loss + weight * torch.mean(torch.abs(diff_phase.diff(dim=-2)))
 
         return loss
 
@@ -1380,14 +1384,36 @@ class ObjectMultiplexed(ObjectPixelated):
     def forward(self, patch_indices: torch.Tensor, batch_indices: torch.Tensor):
         """Get patch indices of the object"""
         # using the batch indicies to select which channel to use for each patch
-        patches = []
-        # return self._get_obj_patches(self.obj[0,...], patch_indices)
-        for i, batch_id in enumerate(batch_indices):
-            # find the correct object channel
-            ch = int(self.patches_mask[batch_id])
-            patch = self._get_obj_patches(self.obj[ch,...], patch_indices[i])
-            patches.append(patch)
-        return torch.stack(patches, dim=0).transpose(0,1)
+        # patches = []
+        # # return self._get_obj_patches(self.obj[0,...], patch_indices)
+        # for i, batch_id in enumerate(batch_indices):
+        #     # find the correct object channel
+        #     ch = int(self.patches_mask[batch_id])
+        #     patch = self._get_obj_patches(self.obj[ch,...], patch_indices[i])
+        #     patches.append(patch)
+        # patches = torch.stack(patches, dim=0).transpose(0,1)
+
+        n_slices = self.obj.shape[-3]
+        out = torch.empty(
+            (
+                n_slices, 
+                patch_indices.shape[0], 
+                patch_indices.shape[-2], 
+                patch_indices.shape[-1]
+            ),
+            dtype=self.obj.dtype,
+            device=self.obj.device,
+            )
+        batch_elem_to_ch = self.patches_mask[batch_indices]
+        for ch in range(self.obj.shape[0]):
+            # find batch elements that belong to this channel
+            ch_batch_mask = batch_elem_to_ch == ch
+            ch_patches_ids = patch_indices[ch_batch_mask,...]
+            ch_patches = self._get_obj_patches(self.obj[ch,...], ch_patches_ids)
+            # ch_patches = ch_patches.transpose(0,1) # [batch elem, z, y, x]
+            out[:,ch_batch_mask,...] = ch_patches
+        
+        return out
 
 # class ObjectImplicit(ObjectBase):
 #     """
