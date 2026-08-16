@@ -10,7 +10,11 @@ Every wrapper has the signature:
 - merged_scan: (ny, nx, ndet, ndet) float array, checkerboard-interlaced 4D-STEM
   data. Each diffraction pattern is expected to be normalized (sums to 1) --
   i.e. a noiseless or already-renormalized-after-Poisson-noise probability
-  image, matching the convention used throughout notebooks 01-03.
+  image, matching the convention used throughout notebooks 01-03. Methods that
+  build a native-resolution Dataset4dstem internally (co_reconstruction_regularized,
+  co_reconstruction_regularized_reparam, linearized_model) accept either the
+  raw array or an already-built Dataset4dstem -- passing a Dataset4dstem skips
+  rebuilding/recalibrating it (see _as_dset4dstem).
 - scan_mask: (ny, nx) array, 0 for "off"/base-state scan positions, 1 for
   "on"/excited-state positions (checkerboard, (i+j) even <-> mask==1).
 - scan_params: dict with keys 'probe_energy' (eV), 'probe_semiangle' (mrad),
@@ -38,7 +42,11 @@ from quantem.diffractive_imaging.complex_probe import (
 from quantem.diffractive_imaging.dataset_models import PtychographyDatasetRaster
 from quantem.diffractive_imaging.detector_models import DetectorPixelated
 from quantem.diffractive_imaging.direct_ptychography import DirectPtychography
-from quantem.diffractive_imaging.object_models import ObjectMultiplexed, ObjectPixelated
+from quantem.diffractive_imaging.object_models import (
+    ObjectMultiplexed,
+    ObjectMultiplexReparameterized,
+    ObjectPixelated,
+)
 from quantem.diffractive_imaging.probe_models import ProbePixelated
 from quantem.diffractive_imaging.ptychography import Ptychography
 from quantem.diffractive_imaging.ptycho_utils import center_crop_arr
@@ -119,6 +127,30 @@ def _match_shape_2d(*arrays):
     return [center_crop_arr(a, shape, pad_if_needed=False) for a in arrays]
 
 
+def _dset4dstem_from_merged_scan(merged_scan: np.ndarray, scan_params: dict) -> Dataset4dstem:
+    """Build a native-resolution Dataset4dstem from a raw merged_scan array,
+    calibrating the detector-pixel sampling to mrad via a probe-circle fit."""
+    step = scan_params["scan_step"] / 2.0
+    dset = Dataset4dstem.from_array(
+        merged_scan, name="merged", sampling=(step, step, 1, 1), units=("A", "A", "pixels", "pixels")
+    )
+    probe_qy0, probe_qx0, probe_R = fit_probe_circle(dset.dp_mean.array, show=False)
+    dset.sampling[2] = scan_params["probe_semiangle"] / probe_R
+    dset.sampling[3] = scan_params["probe_semiangle"] / probe_R
+    dset.units[2:] = ["mrad", "mrad"]
+    return dset
+
+
+def _as_dset4dstem(merged_scan: np.ndarray | Dataset4dstem, scan_params: dict) -> Dataset4dstem:
+    """Accept either a raw merged_scan array or an already-built
+    Dataset4dstem. Arrays are converted via _dset4dstem_from_merged_scan;
+    an existing Dataset4dstem is passed through untouched (its calibration
+    is trusted as-is, so the builder is skipped)."""
+    if isinstance(merged_scan, Dataset4dstem):
+        return merged_scan
+    return _dset4dstem_from_merged_scan(merged_scan, scan_params)
+
+
 # ---------------------------------------------------------------------------
 # Method 1: reconstruct & subtract (notebook 01)
 # ---------------------------------------------------------------------------
@@ -196,7 +228,7 @@ def reconstruct_and_subtract(
 # ---------------------------------------------------------------------------
 
 def co_reconstruction_regularized(
-    merged_scan,
+    merged_scan: np.ndarray | Dataset4dstem,
     scan_mask,
     scan_params,
     num_iters=25,
@@ -208,16 +240,10 @@ def co_reconstruction_regularized(
     batch_size=128,
     **kwargs,
 ):
-    step = scan_params["scan_step"] / 2.0
+    dset = _as_dset4dstem(merged_scan, scan_params)
+    step = dset.sampling[0]
     if obj_padding is None:
         obj_padding = _pad_px(step)
-    dset = Dataset4dstem.from_array(
-        merged_scan, name="merged", sampling=(step, step, 1, 1), units=("A", "A", "pixels", "pixels")
-    )
-    probe_qy0, probe_qx0, probe_R = fit_probe_circle(dset.dp_mean.array, show=False)
-    dset.sampling[2] = scan_params["probe_semiangle"] / probe_R
-    dset.sampling[3] = scan_params["probe_semiangle"] / probe_R
-    dset.units[2:] = ["mrad", "mrad"]
 
     pdset = PtychographyDatasetRaster.from_dataset4dstem(dset)
     pdset.preprocess(
@@ -259,6 +285,7 @@ def co_reconstruction_regularized(
     }
     scheduler_params = {
         "object": {"type": "exp", "factor": 9e-2},
+        # "object": {"type": "plateau"},
         "probe": {"type": "plateau"},
     }
     constraints = {
@@ -268,6 +295,105 @@ def co_reconstruction_regularized(
             "identical_slices": True,
             "apply_fov_mask": False,
             "tv_channel_diff": tv_channel_diff,
+        },
+        "probe": {"center_probe": False, "orthogonalize_probe": True},
+        "dataset": {"descan_tv_weight": 0, "descan_shifts_constant": False},
+    }
+
+    ptycho.reconstruct(
+        num_iters=num_iters,
+        reset=True,
+        autograd=True,
+        device="cuda",
+        constraints=constraints,
+        optimizer_params=opt_params,
+        scheduler_params=scheduler_params,
+        batch_size=batch_size,
+        multichannel_mode=True,
+    )
+
+    recon_off = _cropped_channel_phase(ptycho, ptycho.obj_model.obj[0, ...], ptycho.obj_padding_px)[0]
+    recon_on = _cropped_channel_phase(ptycho, ptycho.obj_model.obj[1, ...], ptycho.obj_padding_px)[0]
+
+    return dict(
+        phase_off=recon_off,
+        phase_on=recon_on,
+        delta_phi=recon_on - recon_off,
+        ptycho=ptycho,
+    )
+
+
+def co_reconstruction_regularized_reparam(
+    merged_scan: np.ndarray | Dataset4dstem,
+    scan_mask,
+    scan_params,
+    num_iters=25,
+    tv_weight_mean=1.0,
+    tv_weight_excitation=10.0,
+    obj_padding=None,
+    obj_lr=1e-3,
+    probe_lr=1e-4,
+    batch_size=128,
+    **kwargs,
+):
+    """Same as co_reconstruction_regularized, but using ObjectMultiplexReparameterized
+    (mean/excitation parameterization) instead of ObjectMultiplexed. Regularization is
+    TV on the mean_obj and excitation_obj channels directly (tv_weight_mean,
+    tv_weight_excitation) rather than ObjectMultiplexed's tv_weight/tv_channel_diff."""
+    dset = _as_dset4dstem(merged_scan, scan_params)
+    step = dset.sampling[0]
+    if obj_padding is None:
+        obj_padding = _pad_px(step)
+
+    pdset = PtychographyDatasetRaster.from_dataset4dstem(dset)
+    pdset.preprocess(
+        com_fit_function="constant",
+        plot_rotation=False,
+        plot_com=False,
+        probe_energy=scan_params["probe_energy"],
+        force_com_rotation=0,
+        force_com_transpose=False,
+    )
+
+    probe_params = {
+        "energy": scan_params["probe_energy"],
+        "defocus": scan_params["probe_defocus"],
+        "semiangle_cutoff": scan_params["probe_semiangle"],
+    }
+    detector_model = DetectorPixelated()
+    probe_model = ProbePixelated.from_params(num_probes=1, probe_params=probe_params)
+    obj_model = ObjectMultiplexReparameterized.from_uniform(
+        num_slices=1,
+        slice_thicknesses=1,
+        obj_type="pure_phase",
+        patches_mask=torch.tensor(scan_mask),
+    )
+
+    ptycho = Ptychography.from_models(
+        dset=pdset,
+        obj_model=obj_model,
+        probe_model=probe_model,
+        detector_model=detector_model,
+        device="cuda",
+    )
+    ptycho.preprocess(obj_padding_px=(obj_padding, obj_padding), batch_size=batch_size)
+
+    opt_params = {
+        "object": {"type": "adam", "lr": obj_lr},
+        "probe": {"type": "adam", "lr": probe_lr},
+    }
+    scheduler_params = {
+        "object": {"type": "exp", "factor": 9e-2},
+        # "object": {"type": "plateau"},
+        "probe": {"type": "plateau"},
+    }
+    constraints = {
+        "object": {
+            "tv_weight_mean_xy": tv_weight_mean,
+            "tv_weight_excitation_xy": tv_weight_excitation,
+            "fix_potential_baseline": False,
+            "identical_slices": True,
+            "apply_fov_mask": False,
         },
         "probe": {"center_probe": False, "orthogonalize_probe": True},
         "dataset": {"descan_tv_weight": 0, "descan_shifts_constant": False},
@@ -422,7 +548,7 @@ def direct_ssb(merged_scan, scan_mask, scan_params, **kwargs):
 # ---------------------------------------------------------------------------
 
 def linearized_model(
-    merged_scan,
+    merged_scan: np.ndarray | Dataset4dstem,
     scan_mask,
     scan_params,
     num_iters_off=25,
@@ -437,18 +563,12 @@ def linearized_model(
     l2_weight=0.0,
     **kwargs,
 ):
-    step = scan_params["scan_step"] / 2.0
+    dset = _as_dset4dstem(merged_scan, scan_params)
+    merged_arr = dset.array
+    step = dset.sampling[0]
     if obj_padding is None:
         obj_padding = _pad_px(step)
-    ndet = merged_scan.shape[-1]
-
-    dset = Dataset4dstem.from_array(
-        merged_scan, name="merged", sampling=(step, step, 1, 1), units=("A", "A", "pixels", "pixels")
-    )
-    probe_qy0, probe_qx0, probe_R = fit_probe_circle(dset.dp_mean.array, show=False)
-    dset.sampling[2] = scan_params["probe_semiangle"] / probe_R
-    dset.sampling[3] = scan_params["probe_semiangle"] / probe_R
-    dset.units[2:] = ["mrad", "mrad"]
+    ndet = merged_arr.shape[-1]
 
     pdset = PtychographyDatasetRaster.from_dataset4dstem(dset)
     pdset.preprocess(
@@ -552,7 +672,7 @@ def linearized_model(
     # raw, single-shot on-mode DPs at their true native positions -- never averaged
     on_batch_np = on_batch.detach().cpu().numpy()
     I_on_meas = torch.from_numpy(
-        merged_scan.reshape(-1, ndet, ndet)[on_batch_np].astype(np.float32)
+        merged_arr.reshape(-1, ndet, ndet)[on_batch_np].astype(np.float32)
     ).to(device)
 
     I_off_baseline = Psi_off.abs() ** 2
