@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from quantem.core import config
@@ -360,6 +361,24 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
             )
             self.add_soft_constraint_loss("tv_channel_diff", tv_channel_diff)
             loss = loss + tv_channel_diff
+
+        if "channel_diff_sparcity" in self.constraints and self.constraints["channel_diff_sparcity"] > 0:
+            channel_diff_sparcity = self.get_channel_diff_sparcity_loss(
+                obj,
+                weight=self.constraints["channel_diff_sparcity"]
+            )
+            self.add_soft_constraint_loss("channel_diff_sparcity", channel_diff_sparcity)
+            loss = loss + channel_diff_sparcity
+
+        if "channel_diff_group_sparcity" in self.constraints and self.constraints["channel_diff_group_sparcity"] > 0:
+            channel_diff_group_sparcity = self.get_channel_diff_group_sparcity_loss(
+                obj,
+                weight=self.constraints["channel_diff_group_sparcity"],
+                block_size=self.constraints.get("channel_diff_group_sparcity_block_size", 4),
+            )
+            self.add_soft_constraint_loss("channel_diff_group_sparcity", channel_diff_group_sparcity)
+            loss = loss + channel_diff_group_sparcity
+
 
         self.accumulate_constraint_losses()
         return loss
@@ -1249,7 +1268,14 @@ class ObjectMultiplexed(ObjectPixelated):
     DEFAULT_CONSTRAINTS = {
         **ObjectPixelated.DEFAULT_CONSTRAINTS,
         "tv_channel_diff": 0.0,
+        "channel_diff_sparcity": 0.0,
         "joint_tv": 0.0,
+        # group sparsity: pool the differential channel into (block_size x block_size)
+        # blocks via their L2 norm, then apply an L1 (sparsity) penalty over the block
+        # norms -- encourages whole blocks of the excitation map to vanish, rather than
+        # individual pixels as with "channel_diff_sparcity".
+        "channel_diff_group_sparcity": 0.0,
+        "channel_diff_group_sparcity_block_size": 4,
     }
 
     def __init__(
@@ -1346,7 +1372,7 @@ class ObjectMultiplexed(ObjectPixelated):
         diff_phase = obj[channels[0],...].angle() - obj[channels[1],...].angle()        
         col_grad = diff_phase.diff(dim=-1)
         row_grad = diff_phase.diff(dim=-2)
-        grad_size = torch.sqrt(row_grad[:,:,:-1]**2 + col_grad[:,:-1,:]**2 + 1e-6)
+        grad_size = torch.sqrt(row_grad[:,:,:-1]**2 + col_grad[:,:-1,:]**2 + 1e-9)
         loss = loss + weight * torch.mean(grad_size)
         # loss = loss + weight * torch.mean(torch.abs(diff_phase.diff(dim=-1)))
         # loss = loss + weight * torch.mean(torch.abs(diff_phase.diff(dim=-2)))
@@ -1361,6 +1387,7 @@ class ObjectMultiplexed(ObjectPixelated):
         obj:    tensor with shape (..., H, W)
         channels: tuple of two indices into the channel dimension of obj
         """
+        raise Exception('deperecated, use get_multi_channel_tv_loss instead')
         loss = self._get_zero_loss_tensor()
 
         c0, c1 = channels
@@ -1380,6 +1407,42 @@ class ObjectMultiplexed(ObjectPixelated):
         loss = loss + weight * torch.mean(torch.abs(joint_gy))
 
         return loss
+
+    def get_channel_diff_sparcity_loss(self, obj, weight, channels=(1,0)):
+        loss = self._get_zero_loss_tensor()
+        diff_phase = obj[channels[0],...].angle() - obj[channels[1],...].angle()
+        loss = loss + weight * torch.mean(torch.abs(diff_phase))
+        return loss
+
+    def get_channel_diff_group_sparcity_loss(self, obj, weight, block_size=4, channels=(1,0), eps=1e-8):
+        """Group-sparsity ("group lasso") penalty on the differential channel.
+
+        The (n_slices, H, W) differential phase map is tiled into non-overlapping
+        (block_size x block_size) blocks, each block is reduced to its L2 norm, and
+        an L1 penalty is applied over those block norms. Because the norm couples all
+        pixels within a block, minimizing this loss tends to zero out entire blocks at
+        once (structured/blocky sparsity) rather than scattered individual pixels, as
+        the plain L1 "channel_diff_sparcity" loss does.
+        """
+        loss = self._get_zero_loss_tensor()
+        diff_phase = obj[channels[0],...].angle() - obj[channels[1],...].angle()
+
+        n_slices, h, w = diff_phase.shape
+        pad_h = (-h) % block_size
+        pad_w = (-w) % block_size
+        if pad_h or pad_w:
+            diff_phase = F.pad(diff_phase, (0, pad_w, 0, pad_h))
+
+        # sum of squares per block == avg_pool2d(x**2) * num_pixels_in_block
+        block_sum_sq = F.avg_pool2d(
+            diff_phase.pow(2).unsqueeze(1), kernel_size=block_size, stride=block_size
+        ) * (block_size ** 2)
+        group_norms = torch.sqrt(block_sum_sq.squeeze(1) + eps)
+
+        loss = loss + weight * torch.mean(group_norms)
+        return loss
+
+
 
     def forward(self, patch_indices: torch.Tensor, batch_indices: torch.Tensor):
         """Get patch indices of the object"""
@@ -1412,8 +1475,174 @@ class ObjectMultiplexed(ObjectPixelated):
             ch_patches = self._get_obj_patches(self.obj[ch,...], ch_patches_ids)
             # ch_patches = ch_patches.transpose(0,1) # [batch elem, z, y, x]
             out[:,ch_batch_mask,...] = ch_patches
-        
+
         return out
+
+
+class ObjectMultiplexReparameterized(ObjectMultiplexed):
+    """
+    Object model for multiplexed objects, identical to ObjectMultiplexed except that
+    the underlying (optimized) parameter is reparameterized in terms of the mean and
+    excitation of the base and excited states, rather than the states themselves.
+
+    Always has exactly two channels. Internally, obj[0] = mean_obj = (obj_excited + obj_base) / 2
+    and obj[1] = excitation_obj = (obj_excited - obj_base) / 2, so that the physical states
+    are recovered as obj_base = mean_obj - excitation_obj and obj_excited = mean_obj + excitation_obj.
+
+    Soft TV regularization is applied directly to the mean_obj and excitation_obj channels
+    (rather than ObjectMultiplexed's tv_channel_diff, which is a base/excited edge-alignment
+    loss), each with its own (z, xy) weight pair -- analogous to how tv_weight_z/tv_weight_xy
+    let the regular object weight the slice axis and the spatial (xy) axes differently.
+    """
+
+    DEFAULT_CONSTRAINTS = {
+        **ObjectPixelated.DEFAULT_CONSTRAINTS,
+        "tv_weight_mean_z": 0.0,
+        "tv_weight_mean_xy": 0.0,
+        "tv_weight_excitation_z": 0.0,
+        "tv_weight_excitation_xy": 0.0,
+    }
+
+    def __init__(
+        self,
+        patches_mask: torch.Tensor,
+        num_slices: int = 1,
+        **kwargs,
+    ):
+        super().__init__(
+            num_channels=2,
+            patches_mask=patches_mask,
+            num_slices=num_slices,
+            **kwargs,
+        )
+
+    @classmethod
+    def from_uniform(
+        cls,
+        patches_mask: torch.Tensor,
+        num_slices: int = 1,
+        slice_thicknesses: float | Sequence | None | np.ndarray = None,
+        device: str = "cpu",
+        obj_type: Literal["complex", "pure_phase", "potential"] = "complex",
+        rng: np.random.Generator | int | None = None,
+    ):
+        """
+        Create ObjectMultiplexReparameterized from a uniform initialization.
+        """
+        obj_model = cls(
+            patches_mask=patches_mask,
+            num_slices=num_slices,
+            slice_thicknesses=slice_thicknesses,
+            device=device,
+            obj_type=obj_type,
+            initialize_mode="uniform",
+            rng=rng,
+            _token=cls._token,
+        )
+
+        return obj_model
+
+    @property
+    def mean_obj(self):
+        """Raw (pre-constraint) mean of the base and excited states, i.e. obj[0]."""
+        return self._obj[0]
+
+    @property
+    def excitation_obj(self):
+        """Raw (pre-constraint) excitation of the base and excited states, i.e. obj[1]."""
+        return self._obj[1]
+
+    @property
+    def obj(self):
+        # reconstruct the physical base/excited states from the mean/excitation
+        # parameterization, then apply hard constraints to each physical channel
+        # separately, exactly as ObjectMultiplexed does
+        mean_obj = self._obj[0]
+        excitation_obj = self._obj[1]
+        obj_base = mean_obj - excitation_obj
+        obj_excited = mean_obj + excitation_obj
+        physical_obj = torch.stack([obj_base, obj_excited], dim=0)
+
+        post_constraint_obj = torch.zeros_like(physical_obj)
+        for ch in range(physical_obj.shape[0]):
+            post_constraint_obj[ch] = self.apply_hard_constraints(
+                physical_obj[ch], mask=self.mask
+            )
+        return post_constraint_obj
+
+    def apply_soft_constraints(
+        self, obj: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        # obj here is self.obj (post-hard-constraint physical base/excited channels);
+        # recover mean/excitation from it and TV-regularize each with its own (z, xy) weights,
+        # instead of ObjectMultiplexed's base/excited edge-alignment tv_channel_diff loss
+        self.reset_soft_constraint_losses()
+
+        mean_obj = (obj[0] + obj[1]) / 2
+        excitation_obj = (obj[1] - obj[0]) / 2
+
+        mean_tv_loss = self.get_tv_loss(
+            mean_obj,
+            weights=(self.constraints["tv_weight_mean_z"], self.constraints["tv_weight_mean_xy"]),
+        )
+        self.add_soft_constraint_loss("mean_tv_loss", mean_tv_loss)
+
+        excitation_tv_loss = self.get_tv_loss(
+            excitation_obj,
+            weights=(
+                self.constraints["tv_weight_excitation_z"],
+                self.constraints["tv_weight_excitation_xy"],
+            ),
+        )
+        self.add_soft_constraint_loss("excitation_tv_loss", excitation_tv_loss)
+
+        surface_zero_loss = self.get_surface_zero_loss(
+            obj,
+            weight=self.constraints["surface_zero_weight"],
+        )
+        self.add_soft_constraint_loss("surface_zero_loss", surface_zero_loss)
+
+        loss = mean_tv_loss + excitation_tv_loss + surface_zero_loss
+
+        self.accumulate_constraint_losses()
+        return loss
+
+    def _initialize_obj(
+        self,
+        shape: tuple[int, int, int] | np.ndarray,
+        sampling: tuple[float, float] | np.ndarray | None = None,
+    ) -> None:
+        if sampling is not None:
+            self.sampling = sampling
+
+        # generate the initial obj_base / obj_excited exactly as ObjectMultiplexed
+        # would, then reparameterize into mean_obj / excitation_obj before storing
+        init_shape = (self.num_channels,) + tuple(int(x) for x in shape)
+        if self._initialize_mode == "uniform":
+            if self.obj_type in ["complex", "pure_phase"]:
+                arr = torch.ones(init_shape) * torch.exp(1.0j * torch.zeros(init_shape))
+            else:
+                arr = torch.zeros(init_shape)
+        elif self._initialize_mode == "random":
+            ph = (
+                torch.randn(init_shape, dtype=torch.float32, generator=self._rng_torch) - 0.5
+            ) * 1e-6
+            if self.obj_type == "potential":
+                arr = ph
+            else:
+                arr = torch.exp(1.0j * ph)
+        elif self._initialize_mode == "array":
+            arr = self._initial_obj
+        else:
+            raise ValueError(f"Invalid initialize mode: {self._initialize_mode}")
+
+        arr = arr.type(self.dtype)
+        obj_base, obj_excited = arr[0], arr[1]
+        mean_obj = (obj_excited + obj_base) / 2
+        excitation_obj = (obj_excited - obj_base) / 2
+        self._initial_obj = torch.stack([mean_obj, excitation_obj], dim=0)
+        self.reset()
+
 
 # class ObjectImplicit(ObjectBase):
 #     """

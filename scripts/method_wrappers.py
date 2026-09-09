@@ -297,7 +297,8 @@ def co_reconstruction_regularized(
             "tv_channel_diff": tv_channel_diff,
         },
         "probe": {"center_probe": False, "orthogonalize_probe": True},
-        "dataset": {"descan_tv_weight": 0, "descan_shifts_constant": False},
+        "dataset": {"descan_tv_weight": 0, "descan_shifts_constant": False, "center_scan_positions": True},
+
     }
 
     ptycho.reconstruct(
@@ -512,57 +513,48 @@ def direct_ssb(merged_scan, scan_mask, scan_params, **kwargs):
 
 
 # ---------------------------------------------------------------------------
-# Method 4: linearized forward model (notebook 05's "honest" section --
-# reconstructed phi_off + probe, not ground truth). Reconstructs the base
-# (off) state with ordinary iterative ptychography, then fits the excitation
-# phase Delta-phi as a single convex least-squares problem against the "on"
-# pixels only, using the reconstruction's own forward model for psi_off.
+# Method 4: linearized forward model (notebook 05). Reconstructs the base
+# (off) state with iterative ptychography, restricted to the real, individually
+# -measured off-mode diffraction patterns at their true native scan positions
+# (never block-averaged: two DPs from physically distinct positions are only
+# interchangeable with the DP at their centroid if the object's phase is flat
+# over that span, which is exactly untrue right where an excitation signal is
+# expected). Reconstruction uses ObjectMultiplexed with patches_mask=scan_mask
+# and tv_channel_diff=0 purely to route each native position's gradient to the
+# right channel -- channel 0 (off) evolves only from off-mode data; channel 1
+# (on) is decoupled and discarded.
 #
-# v2: the first version reconstructed phi_off from a 2x2-checkerboard-
-# block-averaged half-resolution "off_cube", then compared the linear fit's
-# predicted intensity against a *separately* block-averaged "on_cube" at the
-# same coarse grid. That's an extra, uncontrolled approximation on top of the
-# Delta-phi linearization itself: averaging two *raw* diffraction patterns
-# from two physically distinct native positions is not the same as the
-# diffraction pattern the probe would actually produce at their centroid
-# whenever the object's phase varies over that 1-native-pixel span -- exactly
-# what happens near the excitation signal we're trying to recover. That
-# mismatch behaves like an extra unmodeled term in the data, which the convex
-# fit dumps into delta_phi wherever the (near-singular) forward operator lets
-# it, producing the large, physically implausible delta_phi seen even at
-# infinite (noiseless) dose. Regularizing it away (the previous fix) treated
-# the symptom, not the cause.
-#
-# Fix: never average diffraction patterns. Reconstruct phi_off at *native*
-# resolution using ObjectMultiplexed with patches_mask=scan_mask (the same
-# per-position light-mode routing the co-reconstruction wrapper already uses)
-# and tv_channel_diff=0 -- this makes channel 0 (off) evolve purely from
-# gradients contributed by the real, raw, individually-measured off-mode DPs
-# at their true native positions (channel 1 just absorbs the on-mode data and
-# is discarded; decoupling means it can't leak into channel 0). psi_off is
-# then forward-simulated with channel 0's own object/probe *exactly at the
-# real native on-mode positions* (forcing channel-0 patches there via
-# `_get_obj_patches`, bypassing the mask's own on/off routing), and fit
-# against the raw (never averaged) on-mode DPs read directly out of
-# merged_scan at those same positions.
+# The excitation phase Delta-phi is then fit as a single convex least-squares
+# problem: channel 0's own object/probe forward-simulate psi_off exactly at
+# the real native on-mode positions (the "missing" off-mode frames there), and
+# Delta-phi is solved with full-batch LBFGS against the raw on-mode DPs read
+# directly out of merged_scan -- the predicted intensity is linear in
+# Delta-phi, so this is a convex quadratic with a single minimum.
 # ---------------------------------------------------------------------------
 
-def linearized_model(
+def _linearized_model_reconstruct_off(
     merged_scan: np.ndarray | Dataset4dstem,
     scan_mask,
     scan_params,
-    num_iters_off=25,
+    num_iters_off=100,
     tv_weight=1.0,
     obj_padding=None,
     obj_lr=1e-3,
     probe_lr=1e-4,
-    batch_size=128,
-    n_iters_fit=300,
-    fit_lr=5e-3,
-    fit_batch_size=2000,
-    l2_weight=0.0,
-    **kwargs,
+    batch_size=512,
 ):
+    """Reconstruct phi_off (and the probe) from only the real, individually
+    measured off-mode frames of merged_scan at their native positions, then
+    forward-simulate psi_off/Psi_off at the on-mode positions (the "missing"
+    off-mode frames there). Returns everything the convex Delta-phi fit below
+    needs, so that fit can be re-run cheaply (e.g. to sweep regularization
+    weights) without repeating this expensive iterative reconstruction.
+
+    batch_size defaults higher here than the other wrappers in this module: any
+    noise left in phi_off from an under-converged/noisy Adam trajectory (small
+    batches -> noisier gradient estimates) propagates straight into Delta-phi
+    with no cancellation mechanism (unlike a paired-difference reconstruction),
+    so this reconstruction benefits from lower-variance updates more than most."""
     dset = _as_dset4dstem(merged_scan, scan_params)
     merged_arr = dset.array
     step = dset.sampling[0]
@@ -603,6 +595,8 @@ def linearized_model(
         probe_model=probe_model,
         detector_model=detector_model,
         device="cuda",
+        rng=0,  # fixed seed: batch-shuffling order otherwise differs every call, so
+        # phi_off's quality (and everything downstream of it) varied a lot run-to-run
     )
     ptycho.preprocess(obj_padding_px=(obj_padding, obj_padding), batch_size=batch_size)
 
@@ -681,6 +675,73 @@ def linearized_model(
     I_on_n = I_on_meas / norm_const
     Psi_off_n = Psi_off / torch.sqrt(norm_const)
 
+    return dict(
+        ptycho=ptycho,
+        device=device,
+        pad_r=pad_r,
+        obj_shape_r=obj_shape_r,
+        psi_off=psi_off,
+        Psi_off_n=Psi_off_n,
+        patch_indices_on=patch_indices_on,
+        I_off_n=I_off_n,
+        I_on_n=I_on_n,
+        norm_const=norm_const,
+    )
+
+
+def _linearized_model_fit_delta_phi(
+    state,
+    max_iter_fit=300,
+    tv_weight=0.0,
+    tv_eps=1e-4,
+    poisson_weighted=True,
+    track_loss=False,
+):
+    """Fit Delta-phi against the off-state reconstruction in `state` (from
+    _linearized_model_reconstruct_off).
+
+    Two optional, still-convex refinements on top of the plain least-squares fit:
+
+    - `poisson_weighted`: the measured on-mode frames are Poisson counts, so their
+      variance scales with their own mean count rate -- an *unweighted* L2 loss
+      implicitly (and wrongly) treats a noisy, near-empty detector pixel as being
+      just as informative as a bright, well-measured one. Weighting each residual by
+      1/I_off (I_off_baseline is a stable, noise-free proxy for the local count level,
+      since Delta-phi is a small perturbation on top of it -- using it instead of the
+      noisy I_on_meas itself avoids feeding the weighting its own noise) approximates
+      the Gauss-Newton expansion of the Poisson negative log-likelihood. The weights
+      are fixed constants (independent of delta_phi), so this is still a convex
+      quadratic form, just a better-conditioned one; weights are capped at 10x the
+      mean to keep near-empty (dark-field) pixels from dominating the fit.
+    - `tv_weight`: a Charbonnier (smoothed total-variation) penalty
+      sqrt(|grad(delta_phi)|^2 + eps^2) on the spatial gradient. Unlike a quadratic
+      (Tikhonov) gradient penalty -- which needs coefficients in the millions to
+      suppress shot noise at low dose, and is numerically unstable there (LBFGS's
+      curvature estimate becomes ill-conditioned across loss terms that differ by six
+      orders of magnitude) -- TV's cost grows *linearly*, not quadratically, with
+      gradient size, so real blob-scale edges aren't punished nearly as hard as
+      Tikhonov punishes them, and useful weights stay in a numerically tame O(1)-O(10)
+      range. Charbonnier's sqrt(x^2+eps^2) is a smooth, convex function of delta_phi
+      (the Euclidean norm of an affine map of delta_phi), so this keeps the whole fit
+      a single convex problem -- still solved by the same full-batch LBFGS.
+    """
+    ptycho = state["ptycho"]
+    device = state["device"]
+    pad_r = state["pad_r"]
+    psi_off = state["psi_off"]
+    Psi_off_n = state["Psi_off_n"]
+    patch_indices_on = state["patch_indices_on"]
+    I_off_n = state["I_off_n"]
+    I_on_n = state["I_on_n"]
+    norm_const = state["norm_const"]
+
+    if poisson_weighted:
+        weight = 1.0 / (I_off_n + 0.2 * I_off_n.mean())
+        weight = torch.clamp(weight, max=10.0 / I_off_n.mean())
+        weight = weight / weight.mean()
+    else:
+        weight = None
+
     def forward_delta_I(dphi_full, patch_idx, psi, Psi_n):
         dphi_patch = dphi_full.reshape(-1)[patch_idx]
         pert = psi * dphi_patch
@@ -688,29 +749,38 @@ def linearized_model(
         Pert_n = Pert_full / torch.sqrt(norm_const)
         return -2.0 * torch.imag(torch.conj(Psi_n) * Pert_n)
 
-    delta_phi = torch.zeros(obj_shape_r, dtype=torch.float32, device=device, requires_grad=True)
-    optimizer = torch.optim.Adam([delta_phi], lr=fit_lr)
+    # Delta-phi enters the predicted intensity linearly (forward_delta_I is
+    # linear in dphi_full), so this least-squares fit is a convex quadratic
+    # with a single minimum: solve it full-batch with LBFGS (quasi-Newton +
+    # a strong-Wolfe line search) rather than mini-batch first-order Adam --
+    # it needs far fewer outer iterations and has no stochastic-gradient noise.
+    delta_phi = torch.zeros(state["obj_shape_r"], dtype=torch.float32, device=device, requires_grad=True)
+    optimizer = torch.optim.LBFGS(
+        [delta_phi],
+        lr=1.0,
+        max_iter=max_iter_fit,
+        tolerance_grad=1e-10,
+        tolerance_change=1e-12,
+        line_search_fn="strong_wolfe",
+    )
+    loss_history = []
 
-    # mini-batch over on-mode positions rather than always full-batch: the
-    # native grid has ~2x as many on-positions as the old half-resolution
-    # grid (plus a larger padded object now that padding is a uniform
-    # physical margin, see PAD_PHYSICAL_A), so a full-batch fit can OOM on
-    # larger scans even though it fit fine on the smaller ones this was
-    # first written against.
-    n_on_total = patch_indices_on.shape[0]
-    mb_size = min(fit_batch_size, n_on_total)
-    fit_rng = np.random.default_rng(0)
-
-    for _ in range(n_iters_fit):
-        idx = torch.from_numpy(fit_rng.choice(n_on_total, size=mb_size, replace=False)).to(device)
+    def closure():
         optimizer.zero_grad()
-        I_on_pred = I_off_n[idx] + forward_delta_I(
-            delta_phi, patch_indices_on[idx], psi_off[idx], Psi_off_n[idx]
-        )
-        data_loss = torch.mean((I_on_pred - I_on_n[idx]) ** 2)
-        loss = data_loss + l2_weight * torch.mean(delta_phi**2) if l2_weight > 0 else data_loss
+        I_on_pred = I_off_n + forward_delta_I(delta_phi, patch_indices_on, psi_off, Psi_off_n)
+        resid2 = (I_on_pred - I_on_n) ** 2
+        loss = torch.mean(weight * resid2) if weight is not None else torch.mean(resid2)
+        if tv_weight > 0:
+            gx = delta_phi[:-1, 1:] - delta_phi[:-1, :-1]
+            gy = delta_phi[1:, :-1] - delta_phi[:-1, :-1]
+            tv = torch.sqrt(gx**2 + gy**2 + tv_eps**2)
+            loss = loss + tv_weight * tv.mean()
         loss.backward()
-        optimizer.step()
+        if track_loss:
+            loss_history.append(loss.item())
+        return loss
+
+    optimizer.step(closure)
 
     delta_phi_crop = _crop_2d(ptycho, delta_phi.detach().cpu().numpy(), pad_r)
     phase_off_crop = _cropped_channel_phase(ptycho, ptycho.obj_model.obj[0, ...], pad_r)[0]
@@ -720,6 +790,39 @@ def linearized_model(
         phase_on=phase_off_crop + delta_phi_crop,
         delta_phi=delta_phi_crop,
         ptycho=ptycho,
+        loss_history=loss_history,
+    )
+
+
+def linearized_model(
+    merged_scan: np.ndarray | Dataset4dstem,
+    scan_mask,
+    scan_params,
+    num_iters_off=100,
+    tv_weight=1.0,
+    obj_padding=None,
+    obj_lr=1e-3,
+    probe_lr=1e-4,
+    batch_size=512,
+    max_iter_fit=300,
+    dphi_tv_weight=0.0,
+    dphi_tv_eps=1e-4,
+    poisson_weighted=True,
+    **kwargs,
+):
+    """tv_weight regularizes the off-state object reconstruction itself (see
+    _linearized_model_reconstruct_off); dphi_tv_weight is the separate Charbonnier-TV
+    weight on the convex Delta-phi fit (see _linearized_model_fit_delta_phi) -- the
+    two are unrelated regularizers on two different, decoupled optimization problems,
+    just given different names to avoid confusing them with each other."""
+    state = _linearized_model_reconstruct_off(
+        merged_scan, scan_mask, scan_params,
+        num_iters_off=num_iters_off, tv_weight=tv_weight, obj_padding=obj_padding,
+        obj_lr=obj_lr, probe_lr=probe_lr, batch_size=batch_size,
+    )
+    return _linearized_model_fit_delta_phi(
+        state, max_iter_fit=max_iter_fit, tv_weight=dphi_tv_weight, tv_eps=dphi_tv_eps,
+        poisson_weighted=poisson_weighted,
     )
 
 
