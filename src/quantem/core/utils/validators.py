@@ -18,7 +18,7 @@ else:
     if config.get("has_cupy"):
         import cupy as cp
 
-TensorLike: TypeAlias = ArrayLike | "torch.Tensor"
+TensorLike: TypeAlias = Union[ArrayLike, "torch.Tensor"]
 
 
 # --- Dataset Validation Functions ---

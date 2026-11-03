@@ -362,6 +362,14 @@ class ObjectConstraints(BaseConstraints, ObjectBase):
             self.add_soft_constraint_loss("tv_channel_diff", tv_channel_diff)
             loss = loss + tv_channel_diff
 
+        if ("channel_diff_l2_grad" in self.constraints
+                and self.constraints["channel_diff_l2_grad"] > 0):
+            l2_grad = self.get_multi_channel_l2_grad_loss(
+                obj, weight=self.constraints["channel_diff_l2_grad"]
+            )
+            self.add_soft_constraint_loss("channel_diff_l2_grad", l2_grad)
+            loss = loss + l2_grad
+
         if "channel_diff_sparcity" in self.constraints and self.constraints["channel_diff_sparcity"] > 0:
             channel_diff_sparcity = self.get_channel_diff_sparcity_loss(
                 obj,
@@ -1268,6 +1276,10 @@ class ObjectMultiplexed(ObjectPixelated):
     DEFAULT_CONSTRAINTS = {
         **ObjectPixelated.DEFAULT_CONSTRAINTS,
         "tv_channel_diff": 0.0,
+        # squared-L2 on the gradient of the differential channel (Tikhonov). The TV
+        # sibling above is an L1 on |grad| and so edge-preserving, which suits a
+        # piecewise-constant excitation; this one suits a smooth one.
+        "channel_diff_l2_grad": 0.0,
         "channel_diff_sparcity": 0.0,
         "joint_tv": 0.0,
         # group sparsity: pool the differential channel into (block_size x block_size)
@@ -1377,6 +1389,27 @@ class ObjectMultiplexed(ObjectPixelated):
         # loss = loss + weight * torch.mean(torch.abs(diff_phase.diff(dim=-1)))
         # loss = loss + weight * torch.mean(torch.abs(diff_phase.diff(dim=-2)))
 
+        return loss
+
+    def get_multi_channel_l2_grad_loss(self, obj, weight, channels=(1, 0)):
+        """Squared-L2 penalty on the gradient of the differential phase (Tikhonov).
+
+        The sibling `get_multi_channel_tv_loss` penalises the gradient *magnitude*
+        (isotropic TV, an L1 on |grad|), which is edge-preserving: it is cheap to keep
+        a sharp step and expensive to keep a gentle ramp. That is the right prior for a
+        piecewise-constant image and the wrong one for a smooth bump. The excitation
+        here is a smooth dipole, so penalising |grad|^2 instead -- which is expensive
+        for steps and cheap for ramps -- matches it better.
+        """
+        loss = self._get_zero_loss_tensor()
+        if weight == 0:
+            return loss
+        diff_phase = obj[channels[0], ...].angle() - obj[channels[1], ...].angle()
+        col_grad = diff_phase.diff(dim=-1)
+        row_grad = diff_phase.diff(dim=-2)
+        loss = loss + weight * torch.mean(
+            row_grad[:, :, :-1] ** 2 + col_grad[:, :-1, :] ** 2
+        )
         return loss
 
     def get_joint_tv_loss(self, obj, weight, channels=(1, 0), eps=1e-8):
