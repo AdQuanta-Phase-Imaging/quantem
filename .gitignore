@@ -187,3 +187,9 @@ ipynb-playground/
 
 # cursor
 .cursor
+
+# simulation caches and reconstruction outputs: large, regenerable from the notebooks
+scripts/linearized-ptycho/data/
+scripts/time_dependent_noise/data/
+scripts/time_dependent_noise/results/*.npz
+scripts/time_dependent_noise/backup/
