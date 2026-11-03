@@ -1,0 +1,71 @@
+{
+  "scan_step_ang": 0.15,
+  "f_nyquist": 3.3333333333333335,
+  "statistic": "sum over detector of |FFT_scan|, diagonal strip",
+  "caveat": "summing |I| over the detector costs ~sqrt(N_det)=192 in SNR",
+  "rows": [
+    {
+      "dose": "1e+06",
+      "dose_value": 1000000.0,
+      "carrier": 120.28847525629057,
+      "valley": 120.33770865161205,
+      "floor": 120.33274961425923,
+      "carrier_over_valley": 0.9995908730864735,
+      "carrier_over_floor": 0.9996320672625649
+    },
+    {
+      "dose": "1e+07",
+      "dose_value": 10000000.0,
+      "carrier": 38.04492339335978,
+      "valley": 38.06732828103122,
+      "floor": 38.058476179954596,
+      "carrier_over_valley": 0.9994114405007349,
+      "carrier_over_floor": 0.999643895711149
+    },
+    {
+      "dose": "1e+08",
+      "dose_value": 100000000.0,
+      "carrier": 12.06044190737857,
+      "valley": 12.034998015908059,
+      "floor": 12.036816551117226,
+      "carrier_over_valley": 1.0021141583435975,
+      "carrier_over_floor": 1.0019627578571968
+    },
+    {
+      "dose": "1e+09",
+      "dose_value": 1000000000.0,
+      "carrier": 3.8876318267052037,
+      "valley": 3.8045972772179084,
+      "floor": 3.807577974617743,
+      "carrier_over_valley": 1.0218247933847058,
+      "carrier_over_floor": 1.0210248752937219
+    },
+    {
+      "dose": "1e+10",
+      "dose_value": 10000000000.0,
+      "carrier": 1.3646212342753568,
+      "valley": 1.2029789625266858,
+      "floor": 1.2047480818482654,
+      "carrier_over_valley": 1.1343683279457892,
+      "carrier_over_floor": 1.1327025581828043
+    },
+    {
+      "dose": "1e+11",
+      "dose_value": 100000000000.0,
+      "carrier": 0.6225742847551956,
+      "valley": 0.3806569804562514,
+      "floor": 0.3815271649743863,
+      "carrier_over_valley": 1.635525727149374,
+      "carrier_over_floor": 1.6317954313868892
+    },
+    {
+      "dose": "inf",
+      "dose_value": null,
+      "carrier": 0.36251478453547037,
+      "valley": 0.0016050311281849972,
+      "floor": 0.0094370096943317,
+      "carrier_over_valley": 225.86152889471353,
+      "carrier_over_floor": 38.414158327421596
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "scan_step_ang": 0.15,
+  "f_nyquist_inv_ang": 3.3333333333333335,
+  "probe_bandwidth_inv_ang": 1.23303,
+  "carrier_vs_floor": {
+    "inf": {
+      "carrier": 0.8193480968475342,
+      "floor": 0.009117849171161652,
+      "valley": 0.0013840189203619957,
+      "carrier_over_floor": 89.86199283039312,
+      "carrier_over_valley": 592.0064276529041
+    },
+    "1e6": {
+      "carrier": 120.30010223388672,
+      "floor": 120.33306884765625,
+      "valley": 120.33946990966797,
+      "carrier_over_floor": 0.9997260386186007,
+      "carrier_over_valley": 0.9996728614825144
+    },
+    "1e5": {
+      "carrier": 379.548095703125,
+      "floor": 379.6854553222656,
+      "valley": 379.7082824707031,
+      "carrier_over_floor": 0.9996382278614702,
+      "carrier_over_valley": 0.9995781320161472
+    }
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "method": "03",
+  "dose": "1e+07",
+  "prefix": "focus0_s010",
+  "overrides": {
+    "defocus_C10_ang": 0.0,
+    "convergence_semiangle_mrad": 30.0,
+    "step_ang": 0.1
+  },
+  "scan_step_ang": 0.1,
+  "n_scan": 300,
+  "num_bf": 9401,
+  "pixel_size_ang": 0.1,
+  "scores": [
+    {
+      "scale": 0.17581665606705715,
+      "rho": 0.5105089681121203,
+      "nrmse": 0.8757708010348129,
+      "snr": 176.92353823230584,
+      "snr_inflation": 1.0,
+      "dose": "1e+07",
+      "variant": "excited SSB - base SSB",
+      "peak": 0.007246989756822586
+    },
+    {
+      "scale": 0.17830864796536816,
+      "rho": 0.40578158559415206,
+      "nrmse": 0.914588904862093,
+      "snr": 132.30511077190508,
+      "snr_inflation": 1.0,
+      "dose": "1e+07",
+      "variant": "direct SSB (interlaced)",
+      "peak": 0.007150794379413128
+    }
+  ]
+}
